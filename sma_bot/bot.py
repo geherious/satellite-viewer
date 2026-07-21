@@ -53,7 +53,10 @@ def _extract_entities(records: list[dict]) -> tuple[dict[int, Satellite], dict[i
     for rec in records:
         nid = int(rec["NORAD_CAT_ID"])
         if nid not in sats:
-            sats[nid] = Satellite(norad_cat_id=nid, object_name=rec.get("OBJECT_NAME"))
+            sats[nid] = Satellite(norad_cat_id=nid)
+        name = rec.get("OBJECT_NAME")
+        if name:
+            sats[nid].object_name = name
         points.setdefault(nid, []).append(SmaHistoryEntry(
             epoch=_parse_iso(rec["EPOCH"]),
             semimajor_axis=float(rec["SEMIMAJOR_AXIS"]),
@@ -169,6 +172,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if pts:
                     existing = db.get_satellite(nid) or Satellite(norad_cat_id=nid)
                     existing.last_fetch_at = now
+                    if sats.get(nid) and sats[nid].object_name:
+                        existing.object_name = sats[nid].object_name
                     db.insert_satellite(existing)
                     db.insert_sma_points(nid, pts)
                 else:
