@@ -1,34 +1,38 @@
 import tempfile
 import os
+from datetime import timedelta
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
-from sma_bot.db import SmaHistoryEntry
+from sma_bot.db import Satellite, SmaHistoryEntry
 
 EARTH_RADIUS_KM = 6378.137
 
 
 def generate_pdf(
-    data: dict[int, list[SmaHistoryEntry]],
+    entities: dict[int, tuple[Satellite, list[SmaHistoryEntry]]],
     output_path: str,
     id_order: list[int],
-    sat_names: dict[int, str] | None = None,
 ) -> str | None:
     tmp_path = os.path.join(tempfile.gettempdir(), output_path)
     pdf = PdfPages(tmp_path)
     successful = 0
 
     for nid in id_order:
-        entries = data.get(nid, [])
+        sat, entries = entities.get(nid, (Satellite(norad_cat_id=nid), []))
         if not entries:
             continue
 
         epochs = [e.epoch for e in entries]
         altitudes = [e.semimajor_axis - EARTH_RADIUS_KM for e in entries]
-        name = sat_names.get(nid, str(nid)) if sat_names else str(nid)
+        name = sat.object_name or str(nid)
 
         fig, ax = plt.subplots(figsize=(12, 5))
-        ax.plot(epochs, altitudes, linewidth=1.5, color="black")
+        if len(epochs) == 1:
+            ax.plot(epochs, altitudes, marker="o", linewidth=1.5, color="black")
+            ax.set_xlim(epochs[0] - timedelta(days=1), epochs[0] + timedelta(days=1))
+        else:
+            ax.plot(epochs, altitudes, linewidth=1.5, color="black")
         ax.set_title(f"{name} — Altitude over Time", fontsize=14)
         ax.set_xlabel("Date (UTC)")
         ax.set_ylabel("Altitude (km)")

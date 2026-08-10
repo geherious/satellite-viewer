@@ -122,35 +122,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cutoff = now - timedelta(days=PLOT_WINDOW_DAYS)
         one_hour_ago = now - timedelta(hours=FRESHNESS_HOURS)
 
-        case_a: list[int] = []
-        case_b: list[int] = []
-        case_c: list[int] = []
+        new_sats: list[int] = []
+        sats_for_refresh: list[int] = []
+        cached_sats: list[int] = []
 
         for nid in sat_ids:
             sat = db.get_satellite(nid)
             if sat is None:
-                case_a.append(nid)
+                new_sats.append(nid)
             elif sat.last_fetch_at is None or sat.last_fetch_at < one_hour_ago:
-                case_b.append(nid)
+                sats_for_refresh.append(nid)
             else:
-                case_c.append(nid)
+                cached_sats.append(nid)
 
         parts = []
-        if case_a:
-            parts.append(f"{len(case_a)} new")
-        if case_b:
-            parts.append(f"{len(case_b)} refresh")
-        if case_c:
-            parts.append(f"{len(case_c)} cached")
+        if new_sats:
+            parts.append(f"{len(new_sats)} new")
+        if sats_for_refresh:
+            parts.append(f"{len(sats_for_refresh)} refresh")
+        if cached_sats:
+            parts.append(f"{len(cached_sats)} cached")
         await update.message.reply_text(f"Processing {len(sat_ids)} satellite(s) ({', '.join(parts)})...")
 
         failed_ids: list[int] = []
-        all_names: dict[int, str] = {}
+        entities: dict[int, tuple[Satellite, list[SmaHistoryEntry]]] = {}
 
-        if case_a:
-            records = stc.fetch_history(case_a)
+        if new_sats:
+            records = stc.fetch_history(new_sats)
             sats, points = _extract_entities(records)
-            for nid in case_a:
+            for nid in new_sats:
                 pts = points.get(nid, [])
                 if pts:
                     sat = sats.get(nid, Satellite(norad_cat_id=nid))
@@ -158,16 +158,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     sat.last_fetch_at = now
                     db.insert_satellite(sat)
                     db.insert_sma_points(nid, pts)
-                    if sat.object_name:
-                        all_names[nid] = sat.object_name
                 else:
                     failed_ids.append(nid)
                     logger.warning("No history data for ID %d", nid)
 
-        if case_b:
-            records = stc.fetch_current(case_b)
+        if sats_for_refresh:
+            records = stc.fetch_current(sats_for_refresh)
             sats, points = _extract_entities(records)
-            for nid in case_b:
+            for nid in sats_for_refresh:
                 pts = points.get(nid, [])
                 if pts:
                     existing = db.get_satellite(nid) or Satellite(norad_cat_id=nid)
@@ -180,14 +178,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     failed_ids.append(nid)
                     logger.warning("No current data for ID %d", nid)
 
-        for nid in case_c:
+        for nid in sat_ids:
             sat = db.get_satellite(nid)
-            if sat and sat.object_name:
-                all_names[nid] = sat.object_name
+            if sat:
+                entities[nid] = (sat, db.get_sma_history([nid], since=cutoff)[nid])
 
-        data = db.get_sma_history(sat_ids, since=cutoff)
-
-        pdf_path = generate_pdf(data, pdf_name, id_order=sat_ids, sat_names=all_names)
+        pdf_path = generate_pdf(entities, pdf_name, id_order=sat_ids)
 
         if pdf_path is None:
             await update.message.reply_text("Could not retrieve data for any of the provided IDs.")
