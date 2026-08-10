@@ -38,5 +38,5 @@ jobs:
             pip install -r requirements.txt
 
             echo "Restarting service..."
-            sudo systemctl restart "$SERVICE_NAME"
-            sudo systemctl status "$SERVICE_NAME" --no-pager
+            sudo /usr/bin/systemctl restart "$SERVICE_NAME"
+            sudo /usr/bin/systemctl status "$SERVICE_NAME" --no-pager
