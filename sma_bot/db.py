@@ -50,6 +50,13 @@ def init_db():
     conn.close()
 
 
+def get_all_satellite_ids() -> list[int]:
+    conn = _connect()
+    rows = conn.execute("SELECT norad_cat_id FROM satellites").fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
 def get_satellite(norad_id: int) -> Satellite | None:
     conn = _connect()
     row = conn.execute(

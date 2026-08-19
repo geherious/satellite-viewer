@@ -1,9 +1,9 @@
+import asyncio
 import re
 import os
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time
 
-from dotenv import load_dotenv
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -11,6 +11,8 @@ from sma_bot.config import BOT_TOKEN, ALLOWED_PHONES
 from sma_bot import db
 from sma_bot.db import Satellite, SmaHistoryEntry
 from sma_bot import spacetrack_client as stc
+from sma_bot.service import SatelliteService, ActualizeStatus
+from sma_bot.cron import actualize_all
 from sma_bot.plotting import generate_pdf
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -20,7 +22,6 @@ logger = logging.getLogger(__name__)
 
 MAX_IDS = 50
 PLOT_WINDOW_DAYS = 90
-FRESHNESS_HOURS = 1
 
 authorized_users: set[int] = set()
 
@@ -38,30 +39,6 @@ def _sanitize_filename(name: str) -> str:
     if not name.endswith(".pdf"):
         name += ".pdf"
     return name
-
-
-def _parse_iso(iso_str: str) -> datetime:
-    dt = datetime.fromisoformat(iso_str)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def _extract_entities(records: list[dict]) -> tuple[dict[int, Satellite], dict[int, list[SmaHistoryEntry]]]:
-    sats: dict[int, Satellite] = {}
-    points: dict[int, list[SmaHistoryEntry]] = {}
-    for rec in records:
-        nid = int(rec["NORAD_CAT_ID"])
-        if nid not in sats:
-            sats[nid] = Satellite(norad_cat_id=nid)
-        name = rec.get("OBJECT_NAME")
-        if name:
-            sats[nid].object_name = name
-        points.setdefault(nid, []).append(SmaHistoryEntry(
-            epoch=_parse_iso(rec["EPOCH"]),
-            semimajor_axis=float(rec["SEMIMAJOR_AXIS"]),
-        ))
-    return sats, points
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -118,66 +95,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pdf_name = _sanitize_filename(pdf_name)
 
     try:
-        now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(days=PLOT_WINDOW_DAYS)
-        one_hour_ago = now - timedelta(hours=FRESHNESS_HOURS)
+        await update.message.reply_text("Working on it...")
+        service = SatelliteService(db, stc)
+        results = await asyncio.get_event_loop().run_in_executor(None, service.actualize, sat_ids)
 
-        new_sats: list[int] = []
-        sats_for_refresh: list[int] = []
-        cached_sats: list[int] = []
-
-        for nid in sat_ids:
-            sat = db.get_satellite(nid)
-            if sat is None:
-                new_sats.append(nid)
-            elif sat.last_fetch_at is None or sat.last_fetch_at < one_hour_ago:
-                sats_for_refresh.append(nid)
-            else:
-                cached_sats.append(nid)
-
+        counts = {s: 0 for s in ActualizeStatus}
+        for r in results:
+            counts[r.status] += 1
         parts = []
-        if new_sats:
-            parts.append(f"{len(new_sats)} new")
-        if sats_for_refresh:
-            parts.append(f"{len(sats_for_refresh)} refresh")
-        if cached_sats:
-            parts.append(f"{len(cached_sats)} cached")
-        await update.message.reply_text(f"Processing {len(sat_ids)} satellite(s) ({', '.join(parts)})...")
+        if counts[ActualizeStatus.New]:
+            parts.append(f"{counts[ActualizeStatus.New]} new")
+        if counts[ActualizeStatus.Refreshed]:
+            parts.append(f"{counts[ActualizeStatus.Refreshed]} refresh")
+        if counts[ActualizeStatus.Cached]:
+            parts.append(f"{counts[ActualizeStatus.Cached]} cached")
+        await update.message.reply_text(f"Processed {len(sat_ids)} satellite(s) ({', '.join(parts)})...")
 
-        failed_ids: list[int] = []
+        cutoff = datetime.now(timezone.utc) - timedelta(days=PLOT_WINDOW_DAYS)
         entities: dict[int, tuple[Satellite, list[SmaHistoryEntry]]] = {}
-
-        if new_sats:
-            records = stc.fetch_history(new_sats)
-            sats, points = _extract_entities(records)
-            for nid in new_sats:
-                pts = points.get(nid, [])
-                if pts:
-                    sat = sats.get(nid, Satellite(norad_cat_id=nid))
-                    sat.history_backfilled = True
-                    sat.last_fetch_at = now
-                    db.insert_satellite(sat)
-                    db.insert_sma_points(nid, pts)
-                else:
-                    failed_ids.append(nid)
-                    logger.warning("No history data for ID %d", nid)
-
-        if sats_for_refresh:
-            records = stc.fetch_current(sats_for_refresh)
-            sats, points = _extract_entities(records)
-            for nid in sats_for_refresh:
-                pts = points.get(nid, [])
-                if pts:
-                    existing = db.get_satellite(nid) or Satellite(norad_cat_id=nid)
-                    existing.last_fetch_at = now
-                    if sats.get(nid) and sats[nid].object_name:
-                        existing.object_name = sats[nid].object_name
-                    db.insert_satellite(existing)
-                    db.insert_sma_points(nid, pts)
-                else:
-                    failed_ids.append(nid)
-                    logger.warning("No current data for ID %d", nid)
-
         for nid in sat_ids:
             sat = db.get_satellite(nid)
             if sat:
@@ -193,8 +128,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(document=f, filename=pdf_name)
         os.remove(pdf_path)
 
-        if failed_ids:
-            await update.message.reply_text(f"Note: no data found for IDs: {', '.join(str(i) for i in failed_ids)}")
+        not_found = [r.sat_id for r in results if r.status == ActualizeStatus.NotFound]
+        if not_found:
+            await update.message.reply_text(f"Note: no data found for IDs: {', '.join(str(i) for i in not_found)}")
         else:
             await update.message.reply_text("Done! Send another set of IDs or /start to restart.")
 
@@ -209,6 +145,11 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.CONTACT, contact_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    jq = app.job_queue
+    jq.run_daily(actualize_all, time=time(hour=00, minute=3), name="cron_00_03")
+    jq.run_daily(actualize_all, time=time(hour=12, minute=3), name="cron_12_03")
+
     logger.info("Bot is running...")
     app.run_polling()
 
